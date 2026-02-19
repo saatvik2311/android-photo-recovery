@@ -1,0 +1,10 @@
+# Recovery output
+recovered_images/
+
+# System files
+.DS_Store
+.thumbnails/
+
+# Python
+__pycache__/
+*.pyc
