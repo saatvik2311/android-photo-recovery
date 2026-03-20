@@ -54,8 +54,8 @@ fi
 echo "✅  Device detected! Starting recovery ..."
 echo ""
 
-# Run the Python recovery script
-python3 -u "$RECOVERY_SCRIPT"
+# Run the Python script (unbuffered output)
+python3 -u "$SCRIPT_DIR/recover_files.py"
 
 echo ""
 echo "🎉  Recovery complete! Check the 'recovered_images' folder."

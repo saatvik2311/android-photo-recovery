@@ -21,11 +21,20 @@ from datetime import datetime, timedelta
 
 
 # ─── Configuration ───────────────────────────────────────────────────────────
-INTERNAL_STORAGE = "/sdcard"
+# Configuration
+ANDROID_BASE_DIR = "/sdcard"
 TARGET_FOLDER = "Android"
-IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
+# Expanded support for documents and images
+FILE_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".heic", ".webp",  # Images
+    ".pdf", ".doc", ".docx", ".txt", ".rtf",    # Documents
+    ".epub", ".mobi", ".azw3",                  # eBooks
+    ".xlsx", ".xls", ".pptx", ".ppt", ".csv"    # Office
+)
 # Output directory (sibling to this script)
-OUTPUT_DIR = Path(__file__).parent / "recovered_images"
+# Default to 'recovered_files' in the same directory as the script
+SCRIPT_DIR = Path(__file__).parent.resolve()
+OUTPUT_DIR = SCRIPT_DIR / "recovered_files"
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -221,122 +230,131 @@ def extract_date_from_filename(filename: str) -> datetime | None:
     return None
 
 
-def scan_images(android_path: str, days_filter: int) -> list[str]:
-    """Recursively find images, filtering by WAMR exclusion and date (last N days)."""
-    print(f"🔎  Scanning for images inside {android_path} ...")
+def scan_files(android_path: str, days_filter: int) -> list[tuple[str, datetime]]:
+    """
+    Scans the given path for matching files (images/docs) recursively.
+    Filters by modification date (via filename) <= days_filter.
+    Returns list of (full_path, date_obj).
+    """
+    print(f"🔎  Scanning for files inside {android_path} ...")
     
-    # Calculate cutoff date
-    now = datetime.now()
-    cutoff_date = now.replace(hour=0, minute=0, second=0, microsecond=0) \
-                  - timedelta(days=days_filter)
-    print(f"📅  Filtering for images from {cutoff_date.date()} to {now.date()}")
-    print("    (Filtering based on filename dates: YYYYMMDD or YYYY-MM-DD)")
+    # Calculate cutoff
+    today = datetime.now()
+    cutoff_date = today - timedelta(days=days_filter)
+    print(f"📅  Filtering for files from {cutoff_date.date()} to {today.date()}")
+    print(f"    (Filtering based on filename dates: YYYYMMDD or YYYY-MM-DD)")
 
-    # Use `find` on the device
-    ext_args = " -o ".join(
-        [f'-iname "*.{ext.lstrip(".")}"' for ext in IMAGE_EXTENSIONS]
-    )
-    # Exclude WAMR directories at the find level to speed it up is tricky with standard find,
-    # so we'll filter in Python.
-    find_cmd = f'find {android_path} -type f \\( {ext_args} \\) 2>/dev/null'
-    output = run_adb_long("shell", find_cmd, timeout=180)
+    # Find all files with matching extensions
+    # -L follows symlinks (usually safe on /sdcard/Android, but standard find is safer)
+    # Using specific extensions to avoid scanning EVERYTHING
+    # Construct -name arguments
+    name_args = []
+    for ext in FILE_EXTENSIONS:
+        name_args.append(f"-name '*{ext}'")
+        name_args.append(f"-name '*{ext.upper()}'") # Add uppercase check for ADB find
     
-    raw_files = [f.strip() for f in output.splitlines() if f.strip()]
+    find_cmd = f"find {android_path} -type f \\( {' -o '.join(name_args)} \\)"
+    
+    # Run find command
+    # This might return A LOT of files.
+    raw_output = run_adb_long("shell", find_cmd, timeout=120)
+    raw_files = raw_output.splitlines()
+    
     valid_files = []
+    skipped_too_old = 0
+    skipped_no_date = 0
+    skipped_excluded = 0
     
-    skipped_wamr = 0
-    skipped_date = 0
-    skipped_undated = 0
+    print(f"    (Analyzing {len(raw_files)} candidate files...)")
 
     for fpath in raw_files:
-        filename = fpath.split("/")[-1]
-        
+        fpath = fpath.strip()
+        if not fpath:
+            continue
+            
         # 1. Safety Exclusions (WAMR, DCIM, Pictures)
-        # Check if "WAMR", "DCIM", or "Pictures" is in the path
-        # Note: Standard DCIM/Pictures are outside /sdcard/Android, but this protects against
-        # apps that might create similarly named folders inside Android/data.
         path_upper = fpath.upper()
         if "WAMR" in path_upper or "/DCIM/" in path_upper or "/PICTURES/" in path_upper:
-            skipped_wamr += 1
-            continue
-            
-        # 2. Date Filtering
-        dt = extract_date_from_filename(filename)
-        if not dt:
-            # If we can't find a date in the filename, strictly we should skip it 
-            # based on "only recover the images in the last week... using naming convention"
-            skipped_undated += 1
+            skipped_excluded += 1
             continue
         
-        if dt < cutoff_date:
-            skipped_date += 1
-            continue
-            
-        valid_files.append(fpath)
+        # 2. Date Filtering
+        # Try to parse date from filename
+        filename = os.path.basename(fpath)
+        file_date = extract_date_from_filename(filename)
+        
+        if file_date:
+            if file_date >= cutoff_date:
+                valid_files.append((fpath, file_date))
+            else:
+                skipped_too_old += 1
+        else:
+            # If we can't get a date from filename, we skip it for safety/relevance
+            # (Or we could check file metadata 'stat', but that's slow for thousands of files)
+            skipped_no_date += 1
 
     print(f"📊  Scan Results:")
-    print(f"    • Total images found: {len(raw_files)}")
-    print(f"    • Skipped (Excluded): {skipped_wamr} (WAMR/DCIM/Pictures)")
-    print(f"    • Skipped (Too Old):  {skipped_date}")
-    print(f"    • Skipped (No Date):  {skipped_undated}")
-    print(f"    • Ready to recover:   {len(valid_files)}\n")
+    print(f"    • Total candidates found: {len(raw_files)}")
+    print(f"    • Skipped (Excluded): {skipped_excluded} (WAMR/DCIM/Pictures)")
+    print(f"    • Skipped (Too Old):  {skipped_too_old}")
+    print(f"    • Skipped (No Date):  {skipped_no_date}")
+    print(f"    • Ready to recover:   {len(valid_files)}")
+    print()
     
     return valid_files
 
 
 # ─── Step 4: Pull images to local machine ───────────────────────────────────
-def pull_images(file_list: list[str], clear_output: bool) -> int:
-    """Pull files to a flattened output directory."""
+def pull_files(file_list: list[tuple[str, datetime]], clear_output: bool = False) -> int:
+    """
+    Pulls the files in `file_list` from the device to OUTPUT_DIR.
+    Handles filename collisions by appending a counter.
+    """
     if not file_list:
-        print("⚠️   Nothing to recover.")
+        print("⚠️  No files to pull.")
         return 0
 
-    # Clean output directory first if requested
-    if clear_output and OUTPUT_DIR.exists():
-        print(f"🧹  Cleaning output directory: {OUTPUT_DIR.resolve()}")
+    print(f"⬇️  Recovering {len(file_list)} files to '{OUTPUT_DIR}' ...")
+    
+    if OUTPUT_DIR.exists() and clear_output:
+        print("    ♻️  Clearing existing output directory...")
         import shutil
         shutil.rmtree(OUTPUT_DIR)
     
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"💾  Saving images to: {OUTPUT_DIR.resolve()}\n")
-
-    success = 0
-    errors = 0
-    seen_filenames = {}
-
-    for idx, remote_path in enumerate(file_list, 1):
-        original_name = remote_path.split("/")[-1]
+    success_count = 0
+    
+    for i, (remote_path, file_date) in enumerate(file_list, start=1):
+        filename = os.path.basename(remote_path)
+        local_path = OUTPUT_DIR / filename
         
-        # Handle duplicate filenames in flattened structure
-        name_part, ext_part = os.path.splitext(original_name)
-        if original_name in seen_filenames:
-            seen_filenames[original_name] += 1
-            count = seen_filenames[original_name]
-            local_filename = f"{name_part}_{count}{ext_part}"
-        else:
-            seen_filenames[original_name] = 0
-            local_filename = original_name
-
-        local_path = OUTPUT_DIR / local_filename
-        tag = f"[{idx}/{len(file_list)}]"
-        
-        try:
-            # Use -p to preserve timestamps if possible, though adb pull usually does
-            run_adb("pull", "-p", remote_path, str(local_path))
+        # Handle Collisions
+        counter = 1
+        stem = local_path.stem
+        suffix = local_path.suffix
+        while local_path.exists():
+            local_path = OUTPUT_DIR / f"{stem}_{counter}{suffix}"
+            counter += 1
             
-            # Verify it arrived
+        # Pull
+        try:
+            run_adb("pull", remote_path, str(local_path))
+            
             if local_path.exists():
-                size_kb = local_path.stat().st_size / 1024
-                print(f"  ✅ {tag}  {local_filename}  ({size_kb:.1f} KB)")
-                success += 1
-            else:
-                print(f"  ❌ {tag}  {local_filename}  — Download failed silently")
-                errors += 1
-        except Exception as e:
-            print(f"  ❌ {tag}  {local_filename}  — {e}")
-            errors += 1
+                success_count += 1
+                # Optional: Set local file modification time to matched date
+                # timestamp = file_date.timestamp()
+                # os.utime(local_path, (timestamp, timestamp))
+                
+                # Print success indicator every 10 files or so to reduce spam
+                if i % 10 == 0 or i == len(file_list):
+                     sys.stdout.write(f"\r    ⏳  Progress: {i}/{len(file_list)}")
+                     sys.stdout.flush()
+        except Exception:
+            print(f"\n    ❌  Failed to pull: {remote_path}")
 
-    return success
+    print(f"\n✅  Successfully recovered {success_count}/{len(file_list)} files.")
+    return success_count
 
 
 # ─── Step 5: Remote Deletion ────────────────────────────────────────────────
@@ -411,37 +429,50 @@ def main():
     display_folder_sizes(android_path)
 
     # 3. Scan
-    images = scan_images(android_path, days_filter=days)
-    if images and should_download:
-        print("  Sample files:")
-        for f in images[:10]:
-            print(f"    • {f}")
-        if len(images) > 10:
-            print(f"    ... and {len(images) - 10} more\n")
-        print()
-    elif images and not should_download:
-        print(f"  Files identified: {len(images)} (Download skipped)")
-
-    # 4. Pull (Optional)
-    recovered = 0
-    if should_download:
-        recovered = pull_images(images, clear_output=should_clear)
-    else:
-        print("  ⏩  Skipping download (Delete Only Mode)")
+    # 3. Scan
+    files = scan_files(android_path, days_filter=days)
     
+    if not files:
+        print("❌  No matching files found based on your criteria.")
+        sys.exit(0)
+
+    # Print sample files if any are found
+    print(f"  Found {len(files)} files matching criteria.")
+    if files and should_download:
+        print("  Sample files:")
+        for fpath, _ in files[:10]: # files is now list of (path, date) tuples
+            print(f"    • {fpath}")
+        if len(files) > 10:
+            print(f"    ... and {len(files) - 10} more\n")
+        print()
+    elif files and not should_download:
+        print(f"  Files identified: {len(files)} (Download skipped)")
+        print() # Add a newline for better formatting
+
+    # 4. Pull (Download) if requested
+    recovered = 0 # Keep recovered count for final message
+    if should_download:
+        recovered = pull_files(files, clear_output=should_clear)
+    else:
+        print("  ⏩  Skipping download (Delete Only Mode)\n") # Added newline
+
     # 5. Remote Deletion (Optional)
-    if should_delete_remote and images:
-        delete_files_from_device(images)
+    if should_delete_remote:
+        # We need the list of remote paths. 
+        # 'files' is a list of (path, date) tuples.
+        remote_paths = [f[0] for f in files]
+        delete_files_from_device(remote_paths)
 
     elapsed = time.time() - start
-    print()
-    print("=" * 60)
+    print(f"=" * 60)
     if should_download:
-        print(f"  ✨  Done!  {recovered} image(s) processed in {elapsed:.1f}s")
+        print(f"  ✨  Done!  {recovered} file(s) processed in {elapsed:.1f}s")
         print(f"  📁  Output: {OUTPUT_DIR.resolve()}")
+        print(f"\n🎉  Recovery complete! Check the '{OUTPUT_DIR.name}' folder.")
     else:
         print(f"  ✨  Done!  Phone cleanup tasks finished in {elapsed:.1f}s")
-    print("=" * 60)
+        print(f"\n🎉  Operation complete!")
+    print(f"=" * 60)
 
 
 if __name__ == "__main__":
